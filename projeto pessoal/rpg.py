@@ -57,6 +57,7 @@ DEFAULT_CFG = {
     "sfx": True,           # efeitos sonoros
     "shake": True,         # tremor de tela nos golpes
     "mp_addr": "",         # último endereço usado no MULTIPLAYER
+    "public_host": "",     # IP/domínio da máquina que roda os 3 servidores públicos (vazio = PUBLIC_HOST)
 }
 
 
@@ -5636,6 +5637,10 @@ def px_button(color, ready, frac):
 PROTO = 1
 DEFAULT_PORT = 5555
 MAX_PLAYERS = 12
+# --- servidores PÚBLICOS (3 salas fixas, 6 vagas cada, entrada instantânea) ---
+PUBLIC_MAX = 6                                   # vagas de cada servidor público
+PUBLIC_HOST = "127.0.0.1"                        # <<< TROQUE pelo IP/domínio da máquina que roda:  python rpg.py --public
+PUBLIC_SERVERS = (("Público 1", 5555), ("Público 2", 5556), ("Público 3", 5557))   # (nome, porta TCP)
 SNAP_DT = 0.05
 HEROES_OK = ("knight", "ranger", "mage", "guardian", "rogue")
 RACES_OK = ("human", "elf", "dwarf", "orc", "halfling", "tiefling")
@@ -5686,6 +5691,35 @@ def _clean_text(s, n):
     return s.strip()[:n]
 
 
+def query_server(host, port, timeout=1.5):
+    """Pergunta a um servidor quantos jogadores ele tem. Retorna {'n','p','max'} ou None se estiver offline."""
+    try:
+        sk = socket.create_connection((host, port), timeout=timeout)
+    except Exception:
+        return None
+    res = None
+    try:
+        sk.settimeout(timeout)
+        sk.sendall(encode({"t": "info", "v": PROTO}))
+        buf = b""
+        while b"\n" not in buf and len(buf) < MAX_LINE:
+            d = sk.recv(1024)
+            if not d:
+                break
+            buf += d
+        m = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+        if isinstance(m, dict) and m.get("t") == "info":
+            res = {"n": _clean_text(m.get("n"), 16), "p": int(_num(m.get("p"), 0, 999)),
+                   "max": int(_num(m.get("max"), 1, 999, PUBLIC_MAX))}
+    except Exception:
+        res = None
+    try:
+        sk.close()
+    except OSError:
+        pass
+    return res
+
+
 # =================================================================== SERVIDOR
 class _Conn:
     def __init__(self, sock, addr):
@@ -5728,8 +5762,9 @@ class _Conn:
 
 
 class Server:
-    def __init__(self, port=DEFAULT_PORT, host="0.0.0.0", log=print):
+    def __init__(self, port=DEFAULT_PORT, host="0.0.0.0", log=print, max_players=MAX_PLAYERS, name=""):
         self.port, self.host, self.log = port, host, log
+        self.max_players, self.name = max_players, name
         self.lock = threading.RLock()
         self.conns = []
         self.next_id = 1
@@ -5760,6 +5795,10 @@ class Server:
             self.conns.clear()
 
     # ---- helpers
+    def count(self):
+        with self.lock:
+            return sum(1 for c in self.conns if c.id is not None)
+
     def players(self):
         with self.lock:
             return [dict(id=c.id, n=c.name, h=c.hero, r=c.race, k=c.k, d=c.d, **c.st)
@@ -5847,6 +5886,9 @@ class Server:
     # ---- mensagens
     def _handle(self, c, m):
         t = m.get("t")
+        if c.id is None and t == "info":              # consulta da lista de servidores (não ocupa vaga)
+            c.send({"t": "info", "n": self.name or f"Servidor {self.port}", "p": self.count(), "max": self.max_players})
+            return
         if c.id is None:
             if t != "hello":
                 c.send({"t": "err", "msg": "esperava hello"})
@@ -5857,7 +5899,7 @@ class Server:
                 c.close()
                 return
             with self.lock:
-                if sum(1 for o in self.conns if o.id is not None) >= MAX_PLAYERS:
+                if sum(1 for o in self.conns if o.id is not None) >= self.max_players:
                     c.send({"t": "err", "msg": "servidor cheio"})
                     c.close()
                     return
@@ -6048,6 +6090,24 @@ class NetClient:
 
 def run_dedicated_server(argv):
     """python rpg.py --server [porta]  ->  servidor dedicado (sem abrir o jogo)."""
+    if "--public" in argv:                        # os 3 servidores públicos de uma vez (6 vagas cada)
+        srvs = []
+        for nm, pt in PUBLIC_SERVERS:
+            try:
+                srvs.append(Server(pt, max_players=PUBLIC_MAX, name=nm).start())
+            except OSError as e:
+                print(f"Não foi possível abrir {nm} na porta {pt}: {e}")
+        if not srvs:
+            sys.exit(1)
+        print(f"{len(srvs)} servidores públicos no ar ({PUBLIC_MAX} vagas cada). Libere as portas "
+              + ", ".join(str(sv.port) for sv in srvs) + " TCP no firewall/roteador.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            for sv in srvs:
+                sv.stop()
+        return
     port = DEFAULT_PORT
     args = [x for x in argv[1:] if x.lstrip("-").isdigit()]
     if args:
@@ -6093,7 +6153,38 @@ class MPMixin:
         self.mp_k = self.mp_d = 0
         self.mp_send_t, self.mp_lock = 0.0, None
         self.mp_lan = lan_ip()
-        self.mp_m = dict(sel=0, slot=None, addr=self.cfg.get("mp_addr") or f"127.0.0.1:{DEFAULT_PORT}", msg="", busy=False)
+        self.mp_m = dict(sel=0, slot=None, addr=self.cfg.get("mp_addr") or f"127.0.0.1:{DEFAULT_PORT}", msg="", busy=False,
+                         queue=[], pub_t=0.0)
+        self.mp_pub_busy = False
+        self.mp_pub = [dict(name=n, host=self.mp_pub_host(), port=pt, ok=None, p=0, max=PUBLIC_MAX) for n, pt in PUBLIC_SERVERS]
+
+    def mp_pub_host(self):
+        return (self.cfg.get("public_host") or PUBLIC_HOST).strip() or PUBLIC_HOST
+
+    def mp_pub_refresh(self):
+        """Atualiza (em thread) quantos jogadores há em cada servidor público."""
+        if self.mp_pub_busy:
+            return
+        self.mp_pub_busy = True
+        host = self.mp_pub_host()
+
+        def work():
+            try:
+                res = [None] * len(PUBLIC_SERVERS)
+
+                def one(i, pt):
+                    res[i] = query_server(host, pt)
+                ths = [threading.Thread(target=one, args=(i, pt), daemon=True) for i, (_, pt) in enumerate(PUBLIC_SERVERS)]
+                for th in ths:
+                    th.start()
+                for th in ths:
+                    th.join()
+                self.mp_pub = [dict(name=n, host=host, port=pt, ok=r is not None, p=r["p"] if r else 0,
+                                    max=r["max"] if r else PUBLIC_MAX)
+                               for (n, pt), r in zip(PUBLIC_SERVERS, res)]
+            finally:
+                self.mp_pub_busy = False
+        threading.Thread(target=work, daemon=True).start()
 
     def mp_visible(self):
         return [q for q in self.mp_players.values() if q.get("room") == self.mp_room and not q.get("dead")]
@@ -6104,16 +6195,17 @@ class MPMixin:
     # ------------------------------------------------------------------ menu MULTIPLAYER
     def mp_rects(self):
         cx = W // 2
-        return dict(panel=pygame.Rect(cx - 310, 140, 620, 400), char=pygame.Rect(cx - 270, 246, 540, 50),
-                    addr=pygame.Rect(cx - 270, 342, 540, 48),
-                    btns=[pygame.Rect(cx - 270 + i * 184, 440, 172, 54) for i in range(3)])
+        return dict(panel=pygame.Rect(cx - 310, 92, 620, 484), char=pygame.Rect(cx - 270, 184, 540, 44),
+                    pub=[pygame.Rect(cx - 270, 262 + i * 44, 540, 38) for i in range(len(PUBLIC_SERVERS))],
+                    addr=pygame.Rect(cx - 270, 424, 540, 42),
+                    btns=[pygame.Rect(cx - 270 + i * 138, 492, 126, 50) for i in range(4)])
 
     def mp_open_menu(self):
         m = self.mp_m
         filled = [i for i, sv in enumerate(self.saves) if sv]
         if m["slot"] is None or m["slot"] not in filled:
             m["slot"] = self.slot if (self.slot in filled) else (filled[0] if filled else None)
-        m["msg"], m["busy"], m["sel"] = "", False, 0
+        m["msg"], m["busy"], m["sel"], m["queue"], m["pub_t"] = "", False, 0, [], 0.0
         self.phase = "mp_menu"
 
     def mp_cycle_slot(self, d):
@@ -6128,10 +6220,13 @@ class MPMixin:
     def mpmenu_key(self, key, uni):
         m = self.mp_m
         if key == pygame.K_ESCAPE:
+            m["queue"] = []
             self.mp_cancel()
             self.phase = "title"
+        elif key in (pygame.K_F1, pygame.K_F2, pygame.K_F3):
+            self.mp_join_public(key - pygame.K_F1)
         elif key == pygame.K_TAB:
-            m["sel"] = (m["sel"] + 1) % 3
+            m["sel"] = (m["sel"] + 1) % 4
         elif key == pygame.K_UP:
             self.mp_cycle_slot(-1)
         elif key == pygame.K_DOWN:
@@ -6150,6 +6245,10 @@ class MPMixin:
                 self.mp_m["sel"] = i
                 self.mp_activate(i)
                 return
+        for i, r in enumerate(R["pub"]):
+            if r.collidepoint(pos):
+                self.mp_join_public(i)
+                return
         if R["char"].collidepoint(pos):
             self.mp_cycle_slot(-1 if pos[0] < R["char"].centerx else +1)
 
@@ -6162,9 +6261,55 @@ class MPMixin:
             self.mp_server = None
         self.mp_m["busy"] = False
 
+    def mp_connect(self, host, port, msg):
+        """Abre a conexão com o personagem escolhido. (Quem chama já fez mp_cancel.)"""
+        m = self.mp_m
+        sv = self.saves[m["slot"]]
+        hello = {"t": "hello", "v": PROTO, "name": sv["name"], "hero": sv["hero"], "race": sv.get("race", "human")}
+        self.mp_net = NetClient()
+        self.mp_net.connect(host, port, hello)
+        m["busy"], m["msg"] = True, msg
+
+    def mp_join_public(self, i):
+        """Entra direto no servidor público i (clique na lista ou F1/F2/F3)."""
+        m = self.mp_m
+        if m["busy"] or not (0 <= i < len(self.mp_pub)):
+            return
+        if m["slot"] is None:
+            m["msg"] = "Crie um personagem primeiro (CRIAR SAVE)."
+            self.play("bad")
+            return
+        sv_ = self.mp_pub[i]
+        if sv_["ok"] is False:
+            m["msg"] = f"{sv_['name']} está offline."
+            self.play("bad")
+            return
+        if sv_["ok"] and sv_["p"] >= sv_["max"]:
+            m["msg"] = f"{sv_['name']} está cheio ({sv_['p']}/{sv_['max']})."
+            self.play("bad")
+            return
+        m["queue"] = []
+        self.mp_cancel()
+        self.mp_connect(sv_["host"], sv_["port"], f"Entrando em {sv_['name']} ...")
+
+    def mp_quick_join(self):
+        """ENTRAR RÁPIDO: vai no servidor público com vaga que já tem mais gente; se falhar, tenta o próximo."""
+        m = self.mp_m
+        cand = [x for x in self.mp_pub if x["ok"] is not False and x["p"] < x["max"]]
+        if not cand:
+            m["msg"] = "Nenhum servidor público com vaga agora. Tente de novo em instantes."
+            self.play("bad")
+            self.mp_pub_refresh()
+            return
+        cand.sort(key=lambda x: -x["p"])
+        m["queue"] = cand[1:]
+        self.mp_cancel()
+        self.mp_connect(cand[0]["host"], cand[0]["port"], f"Entrando em {cand[0]['name']} ...")
+
     def mp_activate(self, i):
         m = self.mp_m
-        if i == 2:
+        if i == 3:                                   # VOLTAR
+            m["queue"] = []
             self.mp_cancel()
             self.phase = "title"
             return
@@ -6174,14 +6319,18 @@ class MPMixin:
             m["msg"] = "Crie um personagem primeiro (CRIAR SAVE)."
             self.play("bad")
             return
+        if i == 0:                                   # ENTRAR RÁPIDO (servidores públicos)
+            self.mp_quick_join()
+            return
         try:
             host, port = parse_addr(m["addr"])
         except ValueError:
             m["msg"] = "Endereço inválido. Use ip:porta (ex.: 192.168.0.10:5555)."
             self.play("bad")
             return
+        m["queue"] = []
         self.mp_cancel()
-        if i == 1:                                   # HOSPEDAR AQUI
+        if i == 2:                                   # HOSPEDAR AQUI
             try:
                 self.mp_server = Server(port, log=lambda *a: None).start()
             except OSError as e:
@@ -6189,16 +6338,17 @@ class MPMixin:
                 self.play("bad")
                 return
             host = "127.0.0.1"
-        sv = self.saves[m["slot"]]
-        hello = {"t": "hello", "v": PROTO, "name": sv["name"], "hero": sv["hero"], "race": sv.get("race", "human")}
-        self.mp_net = NetClient()
-        self.mp_net.connect(host, port, hello)
-        m["busy"], m["msg"] = True, ("Servidor aberto! Conectando..." if i == 1 else f"Conectando em {host}:{port} ...")
+        self.mp_connect(host, port, "Servidor aberto! Conectando..." if i == 2 else f"Conectando em {host}:{port} ...")
         self.cfg["mp_addr"] = m["addr"]
         save_cfg(self.cfg)
 
     def mpmenu_tick(self, dt):
         m = self.mp_m
+        if self.phase == "mp_menu" and not m["busy"]:
+            m["pub_t"] -= dt
+            if m["pub_t"] <= 0:
+                m["pub_t"] = 3.0
+                self.mp_pub_refresh()
         if self.mp_net is None:
             return
         for msg in self.mp_net.poll():
@@ -6210,35 +6360,71 @@ class MPMixin:
             else:
                 self.mp_handle(msg)
         if self.phase == "mp_menu" and self.mp_net is not None and self.mp_net.status in ("error", "closed"):
-            m["msg"] = self.mp_net.err or "Falha na conexão."
+            err = self.mp_net.err or "Falha na conexão."
             self.mp_cancel()
+            if m["queue"]:                           # entrada rápida: tenta o próximo servidor com vaga
+                nx = m["queue"].pop(0)
+                self.mp_connect(nx["host"], nx["port"], f"{err}  Tentando {nx['name']} ...")
+                return
+            m["msg"] = err
+            m["pub_t"] = 0.0
             self.play("bad")
 
     def draw_mpmenu(self):
         R, m = self.mp_rects(), self.mp_m
         self.chunky(R["panel"], (14, 10, 10), None, 22, 4, 6, alpha=238)
-        self.otext("MULTIPLAYER", 46, (255, 232, 150), (W // 2, 182), ow=3)
+        self.otext("MULTIPLAYER", 46, (255, 232, 150), (W // 2, 126), ow=3)
         sv = self.saves[m["slot"]] if m["slot"] is not None else None
         self.text("PERSONAGEM  (↑ ↓)", 18, (168, 158, 144), (R["char"].x + 4, R["char"].y - 16), center=False, shadow=False)
         self.chunky(R["char"], (24, 17, 14), None, 14, 3, 3)
         if sv:
             hn = next((h["name"] for h in HEROES if h["id"] == sv["hero"]), sv["hero"])
-            self.text(f"◄   {sv['name']}  •  {hn}   ►", 28, (255, 255, 255), R["char"].center, shadow=False)
+            self.text(f"◄   {sv['name']}  •  {hn}   ►", 26, (255, 255, 255), R["char"].center, shadow=False)
         else:
             self.text("Crie um personagem primeiro (CRIAR SAVE)", 24, (255, 150, 140), R["char"].center, shadow=False)
-        self.text("ENDEREÇO DO SERVIDOR  (ip:porta)  — digite aqui", 18, (168, 158, 144), (R["addr"].x + 4, R["addr"].y - 16), center=False, shadow=False)
+
+        # --- servidores públicos
+        self.text("SERVIDORES PÚBLICOS  (clique ou F1 / F2 / F3 para entrar na hora)", 18, (168, 158, 144),
+                  (R["pub"][0].x + 4, R["pub"][0].y - 16), center=False, shadow=False)
+        mpos = pygame.mouse.get_pos()
+        for i, (r, ps) in enumerate(zip(R["pub"], self.mp_pub)):
+            full = bool(ps["ok"]) and ps["p"] >= ps["max"]
+            off = ps["ok"] is False
+            hov = r.collidepoint(mpos) and not m["busy"]
+            fill = (44, 26, 12) if hov and not (off or full) else (24, 17, 14)
+            self.chunky(r, fill, (200, 120, 50) if hov and not (off or full) else None, 12, 3, 3)
+            nc = (120, 112, 104) if off else ((200, 150, 150) if full else (255, 240, 210))
+            self.text(f"F{i + 1}   {ps['name']}", 24, nc, (r.x + 16, r.centery), center=False, shadow=False)
+            if off:
+                self.text("OFFLINE", 20, (150, 140, 132), (r.right - 16, r.centery), center=False, shadow=False)
+                continue
+            if ps["ok"] is None:
+                lab, col = "verificando...", (170, 160, 150)
+            elif full:
+                lab, col = "CHEIO", (255, 120, 110)
+            else:
+                lab, col = f"{ps['p']}/{ps['max']}", (150, 232, 170)
+            dots_w = ps["max"] * 14
+            for k in range(ps["max"]):
+                dr = pygame.Rect(r.right - 14 - dots_w + k * 14, r.centery - 6, 10, 12)
+                on = bool(ps["ok"]) and k < ps["p"]
+                pygame.draw.rect(self.screen, (255, 120, 110) if (on and full) else ((150, 232, 170) if on else (58, 46, 40)), dr, border_radius=3)
+            lw_ = self.font(20).size(lab)[0]
+            self.text(lab, 20, col, (r.right - 14 - dots_w - 12 - lw_, r.centery - 10), center=False, shadow=False)
+
+        # --- endereço manual
+        self.text("OU DIGITE UM ENDEREÇO  (ip:porta)", 18, (168, 158, 144), (R["addr"].x + 4, R["addr"].y - 16), center=False, shadow=False)
         self.chunky(R["addr"], (10, 8, 8), (200, 120, 50), 14, 3, 3)
         caret = "|" if int(self.t * 2) % 2 == 0 else " "
-        self.text(m["addr"] + caret, 30, (255, 236, 200), (R["addr"].x + 14, R["addr"].centery), center=False, shadow=False)
-        self.text(f"Seu IP na rede local: {self.mp_lan}:{DEFAULT_PORT}   (internet: libere a porta TCP no roteador)", 18,
-                  (150, 232, 170), (W // 2, 412), shadow=False)
-        for i, (r, lab) in enumerate(zip(R["btns"], ("ENTRAR", "HOSPEDAR AQUI", "VOLTAR"))):
+        self.text(m["addr"] + caret, 28, (255, 236, 200), (R["addr"].x + 14, R["addr"].centery), center=False, shadow=False)
+        self.text(f"Seu IP na rede local: {self.mp_lan}:{DEFAULT_PORT}", 18, (150, 232, 170), (W // 2, 480), shadow=False)
+        for i, (r, lab) in enumerate(zip(R["btns"], ("RÁPIDO", "ENTRAR", "HOSPEDAR", "VOLTAR"))):
             sel = m["sel"] == i
             self.chunky(r, (104, 38, 10) if sel else (24, 13, 12), (200, 120, 50) if sel else (120, 76, 50), 14, 3, 3)
-            self.otext(lab, 25, (255, 255, 255) if sel else (190, 180, 168), r.center, ow=2)
+            self.otext(lab, 22, (255, 255, 255) if sel else (190, 180, 168), r.center, ow=2)
         if m["msg"]:
-            self.otext(m["msg"], 22, (255, 214, 140) if m["busy"] else (255, 140, 130), (W // 2, 520), ow=2)
-        self.draw_keybar(597, (("TAB", "botão"), (" ↑ ↓ ", "personagem"), ("ENTER", "confirmar"), ("ESC", "voltar")))
+            self.otext(m["msg"], 21, (255, 214, 140) if m["busy"] else (255, 140, 130), (W // 2, 556), ow=2)
+        self.draw_keybar(597, (("TAB", "botão"), ("F1-F3", "servidor"), ("ENTER", "confirmar"), ("ESC", "voltar")))
 
     # ------------------------------------------------------------------ entrar / sair
     def mp_begin(self, welcome):
@@ -6256,6 +6442,7 @@ class MPMixin:
             self.mp_upsert(p)
         self.mp_chat, self.mp_feed, self.mp_typing = [], [], None
         self.mp_k = self.mp_d = 0
+        self.mp_m["queue"] = []
         self.mp_maxhp = 60 + 20 * self.maxhp
         self.mp_lobby(first=True)
         self.mp_m["busy"] = False
