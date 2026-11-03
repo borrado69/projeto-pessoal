@@ -1,0 +1,8 @@
+{
+  "mode": "manual",
+  "speed": 1.0,
+  "music": true,
+  "music_vol": 1.0,
+  "sfx": true,
+  "shake": true
+}
