@@ -59,6 +59,8 @@ DEFAULT_CFG = {
     "mp_addr": "",         # último endereço usado no MULTIPLAYER
     "public_host": "",     # IP/domínio da máquina que roda os 3 servidores públicos (vazio = automático)
     "public_host_last": "",  # último host público que respondeu (guardado automaticamente)
+    "username": "",        # nome de usuário único (conta online)
+    "token": "",           # chave secreta da conta (gerada sozinha; não compartilhe)
     "auto_host": False,    # True = ao abrir o jogo, já sobe os 3 servidores públicos e abre as portas no roteador (UPnP)
 }
 
@@ -100,7 +102,7 @@ def save_cfg(cfg):
 # ------------------------------------------------------------------ saves (5 slots)
 NSLOTS = 5
 NAME_MAX = 12
-MENU_PHASES = ("title", "slots", "create", "mp_menu")     # telas de menu (a partida não roda nelas)
+MENU_PHASES = ("title", "slots", "create", "mp_menu", "username")     # telas de menu (a partida não roda nelas)
 try:
     SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obscurity_saves.json")
 except NameError:
@@ -5644,7 +5646,7 @@ def px_button(color, ready, frac):
 
 
 # ===================================================================== REDE (multiplayer)
-PROTO = 1
+PROTO = 2
 DEFAULT_PORT = 5555
 MAX_PLAYERS = 12
 # --- servidores PÚBLICOS (3 salas fixas, 6 vagas cada, entrada instantânea) ---
@@ -5663,6 +5665,211 @@ HEROES_OK = ("knight", "ranger", "mage", "guardian", "rogue")
 RACES_OK = ("human", "elf", "dwarf", "orc", "halfling", "tiefling")
 ROOMS = ("lobby", "arena", "none")
 MAX_LINE = 16384
+USER_MIN, USER_MAX = 3, 12
+MAX_FRIENDS, MAX_PENDING = 50, 30
+try:
+    SOCIAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obscurity_users.json")
+except NameError:
+    SOCIAL_PATH = "obscurity_users.json"
+
+
+def valid_user(u):
+    u = str(u or "")
+    return USER_MIN <= len(u) <= USER_MAX and all((ch.isascii() and ch.isalnum()) or ch == "_" for ch in u)
+
+
+class Social:
+    """Contas, amigos e convites. Compartilhado pelos servidores públicos do mesmo programa; salvo em JSON."""
+
+    def __init__(self, path=SOCIAL_PATH):
+        import hashlib
+        self._hash = lambda tok: hashlib.sha256(("obscurity|" + tok).encode("utf-8")).hexdigest()
+        self.path, self.lock = path, threading.RLock()
+        self.users = {}                    # chave(minúscula) -> {"name","h","fr":[],"in":[],"out":[]}
+        self.online = {}                   # chave -> (conn, servidor)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.users = {k: v for k, v in data.items() if isinstance(v, dict) and "h" in v}
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.users, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    # ---- entrar / sair
+    def login(self, user, tok, conn, srv):
+        """Retorna (True, chave) ou (False, (codigo, mensagem))."""
+        if not valid_user(user):
+            return False, ("bad_name", "Nome de usuário inválido (3 a 12 letras, números ou _).")
+        tok = str(tok or "")
+        if len(tok) < 16 or len(tok) > 128:
+            return False, ("bad_tok", "Conta inválida. Reabra o jogo.")
+        key = user.lower()
+        old = None
+        with self.lock:
+            u = self.users.get(key)
+            if u is None:
+                self.users[key] = {"name": user, "h": self._hash(tok), "fr": [], "in": [], "out": []}
+                self._save()
+            elif u["h"] != self._hash(tok):
+                return False, ("name_taken", f"O nome '{u['name']}' já pertence a outra pessoa. Escolha outro.")
+            prev = self.online.get(key)
+            if prev is not None and prev[0] is not conn:
+                old = prev[0]
+            self.online[key] = (conn, srv)
+        if old is not None:
+            old.send({"t": "err", "msg": "Você entrou em outro lugar."})
+            old.close()
+        self.push_presence(key)
+        return True, key
+
+    def logout(self, conn, key):
+        if not key:
+            return
+        with self.lock:
+            cur = self.online.get(key)
+            if cur is None or cur[0] is not conn:
+                return
+            del self.online[key]
+        self.push_presence(key)
+
+    # ---- dados
+    def display(self, key):
+        u = self.users.get(key)
+        return u["name"] if u else key
+
+    def payload(self, key):
+        with self.lock:
+            u = self.users.get(key)
+            if not u:
+                return {"t": "fl", "f": [], "in": [], "out": []}
+            fl = []
+            for fk in u["fr"]:
+                on = self.online.get(fk)
+                fl.append({"u": self.display(fk), "on": 1 if on else 0,
+                           "s": on[1].name if on else "", "p": on[1].port if on else 0})
+            fl.sort(key=lambda d: (-d["on"], d["u"].lower()))
+            return {"t": "fl", "f": fl, "in": [self.display(k) for k in u["in"]],
+                    "out": [self.display(k) for k in u["out"]]}
+
+    def push(self, key):
+        with self.lock:
+            cur = self.online.get(key)
+        if cur is not None:
+            cur[0].send(self.payload(key))
+
+    def push_presence(self, key):
+        with self.lock:
+            u = self.users.get(key)
+            targets = list(u["fr"]) if u else []
+        self.push(key)
+        for fk in targets:
+            self.push(fk)
+
+    def note(self, key, msg):
+        with self.lock:
+            cur = self.online.get(key)
+        if cur is not None:
+            cur[0].send({"t": "note", "msg": msg})
+
+    # ---- ações
+    def handle(self, key, m):
+        t = m.get("t")
+        other = str(m.get("u") or "").strip().lower()
+        with self.lock:
+            me = self.users.get(key)
+            if me is None:
+                return
+            if t == "fr_add":
+                if not valid_user(m.get("u")):
+                    return self.note(key, "Nome de usuário inválido.")
+                o = self.users.get(other)
+                if o is None:
+                    return self.note(key, f"O usuário '{m.get('u')}' não existe.")
+                if other == key:
+                    return self.note(key, "Você não pode adicionar a si mesmo.")
+                if other in me["fr"]:
+                    return self.note(key, f"{o['name']} já é seu amigo.")
+                if other in me["in"]:                         # ele já tinha pedido: vira amizade
+                    return self._make_friends(key, other)
+                if other in me["out"]:
+                    return self.note(key, "Pedido já enviado. Aguarde a resposta.")
+                if len(me["out"]) >= MAX_PENDING or len(o["in"]) >= MAX_PENDING:
+                    return self.note(key, "Muitos pedidos pendentes.")
+                me["out"].append(other)
+                o["in"].append(key)
+                self._save()
+                self.note(key, f"Pedido enviado para {o['name']}.")
+                self.note(other, f"{me['name']} quer ser seu amigo (aba PEDIDOS).")
+            elif t == "fr_acc":
+                if other in me["in"]:
+                    if len(me["fr"]) >= MAX_FRIENDS:
+                        return self.note(key, "Sua lista de amigos está cheia.")
+                    return self._make_friends(key, other)
+            elif t in ("fr_rej", "fr_del"):
+                o = self.users.get(other)
+                if o is None:
+                    return
+                for lst in ("in", "out"):
+                    if other in me[lst]:
+                        me[lst].remove(other)
+                    if key in o[lst]:
+                        o[lst].remove(key)
+                if t == "fr_del":
+                    if other in me["fr"]:
+                        me["fr"].remove(other)
+                    if key in o["fr"]:
+                        o["fr"].remove(key)
+                self._save()
+            elif t == "inv":
+                if other not in me["fr"]:
+                    return self.note(key, "Só dá para convidar amigos.")
+                cur = self.online.get(other)
+                mine = self.online.get(key)
+                if cur is None:
+                    return self.note(key, f"{self.display(other)} está offline.")
+                if mine is None:
+                    return
+                cur[0].send({"t": "inv", "from": me["name"], "s": mine[1].name or f"Servidor {mine[1].port}", "p": mine[1].port})
+                return self.note(key, f"Convite enviado para {self.display(other)}.")
+            else:
+                return
+        self.push(key)
+        self.push(other)
+
+    def _make_friends(self, a, b):
+        ua, ub = self.users[a], self.users[b]
+        for x, y in ((ua, b), (ub, a)):
+            for lst in ("in", "out"):
+                if y in x[lst]:
+                    x[lst].remove(y)
+        if b not in ua["fr"]:
+            ua["fr"].append(b)
+        if a not in ub["fr"]:
+            ub["fr"].append(a)
+        self._save()
+        self.note(a, f"Agora você e {ub['name']} são amigos!")
+        self.note(b, f"Agora você e {ua['name']} são amigos!")
+        self.push(a)
+        self.push(b)
+
+
+_SOCIAL = None
+
+
+def get_social():
+    global _SOCIAL
+    if _SOCIAL is None:
+        _SOCIAL = Social()
+    return _SOCIAL
 
 
 def encode(obj):
@@ -5799,7 +6006,7 @@ class AutoHost:
             sv = self.servers.get(pt)
             if sv is None or not sv.running:
                 try:
-                    self.servers[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=self.log).start()
+                    self.servers[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=self.log, social=get_social()).start()
                 except OSError:
                     pass                                   # porta ocupada (outro servidor já está no ar)
 
@@ -5896,6 +6103,7 @@ class _Conn:
         self.out = queue.Queue(maxsize=400)
         self.id = None
         self.name, self.hero, self.race = "", "knight", "human"
+        self.ukey = None
         self.st = {"room": "none", "x": 4.5, "y": 4.5, "hd": 0.0, "mv": 0, "lg": 0.0, "rl": -1.0,
                    "dead": 0, "hp": 1, "pm": 1}
         self.k = self.d = 0
@@ -5931,7 +6139,8 @@ class _Conn:
 
 
 class Server:
-    def __init__(self, port=DEFAULT_PORT, host="0.0.0.0", log=print, max_players=MAX_PLAYERS, name=""):
+    def __init__(self, port=DEFAULT_PORT, host="0.0.0.0", log=print, max_players=MAX_PLAYERS, name="", social=None):
+        self.social = social              # com contas/amigos (servidores públicos); None = servidor privado simples
         self.port, self.host, self.log = port, host, log
         self.max_players, self.name = max_players, name
         self.lock = threading.RLock()
@@ -5990,6 +6199,8 @@ class Server:
             if was:
                 self.conns.remove(c)
         c.close()
+        if self.social is not None and c.ukey:
+            self.social.logout(c, c.ukey)
         if was and c.id is not None:
             self.log(f"[obscurity] {c.name} (#{c.id}) saiu")
             self.broadcast({"t": "leave", "id": c.id, "n": c.name})
@@ -6079,22 +6290,47 @@ class Server:
                 c.send({"t": "err", "msg": f"versão do protocolo incompatível (servidor {PROTO})"})
                 c.close()
                 return
-            with self.lock:
-                if sum(1 for o in self.conns if o.id is not None) >= self.max_players:
-                    c.send({"t": "err", "msg": "servidor cheio"})
+            disp = None
+            if self.social is not None:                  # servidor público: exige conta (nome de usuário único)
+                ok, res = self.social.login(m.get("user"), m.get("tok"), c, self)
+                if not ok:
+                    c.send({"t": "err", "code": res[0], "msg": res[1]})
                     c.close()
                     return
-                c.id = self.next_id
-                self.next_id += 1
-            c.name = _clean_text(m.get("name"), 12) or f"Jogador{c.id}"
+                c.ukey = res
+                disp = self.social.display(res)
+            with self.lock:
+                if sum(1 for o in self.conns if o.id is not None) >= self.max_players:
+                    full = True
+                else:
+                    full = False
+                    c.id = self.next_id
+                    self.next_id += 1
+            if full:
+                c.send({"t": "err", "msg": "servidor cheio"})
+                if c.ukey:
+                    self.social.logout(c, c.ukey)
+                    c.ukey = None
+                c.close()
+                return
+            c.name = disp or _clean_text(m.get("name"), 12) or f"Jogador{c.id}"
             c.hero = m.get("hero") if m.get("hero") in HEROES_OK else "knight"
             c.race = m.get("race") if m.get("race") in RACES_OK else "human"
             c.sock.settimeout(30)
             c.send({"t": "welcome", "id": c.id, "proto": PROTO, "players": self.players()})
+            if self.social is not None:
+                c.send(self.social.payload(c.ukey))
             self.broadcast({"t": "join", "id": c.id, "n": c.name}, skip=c)
             self.log(f"[obscurity] {c.name} (#{c.id}) entrou de {c.addr[0]}")
             return
 
+        if t in ("fr_add", "fr_acc", "fr_rej", "fr_del", "inv"):
+            if self.social is not None and c.ukey:
+                now = time.time()
+                if now - getattr(c, "t_soc", 0.0) >= 0.3:       # anti-spam
+                    c.t_soc = now
+                    self.social.handle(c.ukey, m)
+            return
         if t == "state":
             st = c.st
             room = m.get("room")
@@ -6282,7 +6518,7 @@ def run_dedicated_server(argv):
         srvs = {}
         for nm, pt in PUBLIC_SERVERS:
             try:
-                srvs[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=log).start()
+                srvs[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=log, social=get_social()).start()
             except OSError as e:
                 print(f"Não foi possível abrir {nm} na porta {pt}: {e}")
         if not srvs:
@@ -6299,7 +6535,7 @@ def run_dedicated_server(argv):
                     sv = srvs.get(pt)
                     if sv is None or not sv.running:
                         try:
-                            srvs[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=log).start()
+                            srvs[pt] = Server(pt, max_players=PUBLIC_MAX, name=nm, log=log, social=get_social()).start()
                             log(f"{nm} reiniciado")
                         except OSError:
                             pass
@@ -6355,6 +6591,11 @@ class MPMixin:
                          queue=[], pub_t=0.0)
         self.mp_pub_busy = False
         self._pub_remote = ""
+        self.fr = {"f": [], "in": [], "out": []}
+        self.fr_open, self.fr_tab, self.fr_sel, self.fr_input = False, 0, 0, ""
+        self.fr_inv, self.fr_note, self.fr_note_t = [], "", 0.0
+        self.mp_cur = None
+        self.us_text, self.us_msg = "", ""
         self.mp_pub = [dict(name=n, host=self.mp_pub_host(), port=pt, ok=None, p=0, max=PUBLIC_MAX) for n, pt in PUBLIC_SERVERS]
 
     def mp_pub_host(self):
@@ -6410,7 +6651,67 @@ class MPMixin:
                     rows=[pygame.Rect(130, 190 + i * 62, W - 260, 54) for i in range(5)],
                     back=pygame.Rect(40, 528, 150, 44), quick=pygame.Rect(W - 40 - 190, 528, 190, 44))
 
+    def open_username(self, msg="", nxt="mp"):
+        self.us_text, self.us_msg, self.us_next = "", msg, nxt
+        self.phase = "username"
+
+    def username_key(self, key, uni):
+        if key == pygame.K_ESCAPE:
+            self.phase = "title"
+        elif key == pygame.K_BACKSPACE:
+            self.us_text = self.us_text[:-1]
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.username_confirm()
+        elif uni and len(self.us_text) < USER_MAX and uni.isascii() and (uni.isalnum() or uni == "_"):
+            self.us_text += uni
+
+    def username_confirm(self):
+        u = self.us_text.strip()
+        if not valid_user(u):
+            self.us_msg = f"Use de {USER_MIN} a {USER_MAX} letras, números ou _ (sem espaço)."
+            self.play("bad")
+            return
+        import secrets
+        self.cfg["username"] = u
+        if len(self.cfg.get("token", "")) < 16:
+            self.cfg["token"] = secrets.token_hex(16)
+        save_cfg(self.cfg)
+        self.play("card")
+        if getattr(self, "us_next", "mp") == "title":
+            self.phase = "title"
+        else:
+            self.mp_open_menu()
+
+    def username_click(self, pos):
+        r = pygame.Rect(0, 0, 220, 46)
+        r.center = (W // 2, 440)
+        if r.collidepoint(pos):
+            self.username_confirm()
+
+    def draw_username(self):
+        scr = self.screen
+        box = pygame.Rect(0, 0, 600, 300)
+        box.center = (W // 2, 360)
+        self.rrect(box, (14, 12, 20, 235), 18, 3, (200, 150, 90, 255))
+        self.otext("ESCOLHA SEU NOME DE USUÁRIO", 30, (255, 232, 150), (W // 2, box.y + 40), ow=2)
+        self.text("Ele é único, só seu, e fica salvo. Seus amigos vão te achar por ele.", 19, (210, 206, 220), (W // 2, box.y + 84), shadow=False)
+        fld = pygame.Rect(0, 0, 360, 54)
+        fld.center = (W // 2, box.y + 150)
+        self.rrect(fld, (8, 8, 14, 255), 10, 3, (150, 165, 230, 255))
+        self.text(self.us_text + ("|" if int(self.t * 2) % 2 == 0 else " "), 32, (255, 255, 255), fld.center, shadow=False)
+        if self.us_msg:
+            self.text(self.us_msg, 19, (255, 150, 140), (W // 2, box.y + 200), shadow=False)
+        else:
+            self.text(f"{USER_MIN} a {USER_MAX} caracteres: letras, números ou _", 17, (150, 146, 160), (W // 2, box.y + 200), shadow=False)
+        b = pygame.Rect(0, 0, 220, 46)
+        b.center = (W // 2, 440)
+        self.small_btn(b, "CONFIRMAR")
+        self.draw_keybar(597, (("ENTER", "confirmar"), ("ESC", "voltar")))
+
     def mp_open_menu(self):
+        if not self.cfg.get("username"):
+            self.open_username()
+            return
         m = self.mp_m
         filled = [i for i, sv in enumerate(self.saves) if sv]
         if m["slot"] is None or m["slot"] not in filled:
@@ -6491,7 +6792,10 @@ class MPMixin:
         """Abre a conexão com o personagem escolhido. (Quem chama já fez mp_cancel.)"""
         m = self.mp_m
         sv = self.saves[m["slot"]]
-        hello = {"t": "hello", "v": PROTO, "name": sv["name"], "hero": sv["hero"], "race": sv.get("race", "human")}
+        user, tok = self.cfg.get("username", ""), self.cfg.get("token", "")
+        hello = {"t": "hello", "v": PROTO, "name": user or sv["name"], "user": user, "tok": tok,
+                 "hero": sv["hero"], "race": sv.get("race", "human")}
+        self.mp_cur = (host, port)
         self.mp_net = NetClient()
         self.mp_net.connect(host, port, hello)
         m["busy"], m["msg"] = True, msg
@@ -6599,6 +6903,12 @@ class MPMixin:
                 self.mp_begin(msg)
             elif t == "err":
                 m["msg"] = str(msg.get("msg", "erro do servidor"))
+                if msg.get("code") in ("name_taken", "bad_name", "bad_tok"):
+                    self.cfg["username"] = ""
+                    save_cfg(self.cfg)
+                    self.mp_cancel()
+                    self.open_username(m["msg"])
+                    return
             else:
                 self.mp_handle(msg)
         if self.phase == "mp_menu" and self.mp_net is not None and self.mp_net.status in ("error", "closed"):
@@ -6834,8 +7144,213 @@ class MPMixin:
             self.mp_on_hurt(m)
         elif t == "kill":
             self.mp_on_kill(m)
+        elif t == "fl":
+            self.fr = {"f": m.get("f", []), "in": m.get("in", []), "out": m.get("out", [])}
+            self.fr_sel = max(0, min(self.fr_sel, max(0, self.fr_len() - 1)))
+        elif t == "note":
+            self.fr_note, self.fr_note_t = str(m.get("msg", ""))[:90], self.t + 5.0
+            self.mp_say(self.fr_note)
+        elif t == "inv":
+            who = str(m.get("from", "?"))[:12]
+            self.fr_inv = [i for i in self.fr_inv if i["from"] != who][-3:] + [
+                {"from": who, "s": str(m.get("s", "")), "p": int(_num(m.get("p"), 0, 65535, 0)), "until": self.t + 25.0}]
+            self.play("card")
         elif t == "err":
             self.mp_say(str(m.get("msg", "erro")))
+
+    # ------------------------------------------------------------------ AMIGOS / CONVITES
+    FR_TABS = ("AMIGOS", "PEDIDOS", "ADICIONAR")
+
+    def fr_len(self):
+        return len(self.fr["f"]) if self.fr_tab == 0 else (len(self.fr["in"]) if self.fr_tab == 1 else 0)
+
+    def fr_send(self, obj):
+        if self.mp_net is not None:
+            self.mp_net.send(obj)
+
+    def fr_rects(self):
+        box = pygame.Rect(0, 0, 560, 430)
+        box.center = (W // 2, H // 2)
+        return dict(box=box,
+                    tabs=[pygame.Rect(box.x + 18 + i * 172, box.y + 44, 166, 34) for i in range(3)],
+                    rows=[pygame.Rect(box.x + 18, box.y + 92 + i * 40, box.w - 36, 36) for i in range(6)],
+                    act=pygame.Rect(box.x + 18, box.bottom - 56, 250, 40),
+                    alt=pygame.Rect(box.x + 282, box.bottom - 56, 260, 40),
+                    hud=pygame.Rect(W - 236, 176, 224, 28),
+                    inv_yes=pygame.Rect(W // 2 - 190, 78, 180, 34), inv_no=pygame.Rect(W // 2 + 10, 78, 180, 34))
+
+    def fr_toggle(self, on=None):
+        self.fr_open = (not self.fr_open) if on is None else on
+        self.fr_input = ""
+        self.fr_sel = 0
+        self.play("card")
+
+    def fr_join(self, port, name):
+        """Vai para o servidor onde o amigo está (ou aceita o convite dele)."""
+        if not port:
+            return
+        cur = self.mp_cur
+        if cur is not None and cur[1] == port:
+            self.fr_note, self.fr_note_t = f"Você já está no mesmo servidor de {name}.", self.t + 4.0
+            return
+        host = cur[0] if cur else self.mp_pub_host()
+        self.fr_open = False
+        self.mp_leave("", "mp_menu")
+        self.mp_m["auto"], self.mp_m["queue"] = False, []
+        self.mp_connect(host, port, f"Entrando no servidor de {name} ...")
+
+    def fr_action(self, primary=True):
+        tab, sel = self.fr_tab, self.fr_sel
+        if tab == 0 and 0 <= sel < len(self.fr["f"]):
+            f = self.fr["f"][sel]
+            if primary:
+                if f["on"]:
+                    self.fr_send({"t": "inv", "u": f["u"]})
+                else:
+                    self.fr_note, self.fr_note_t = f"{f['u']} está offline.", self.t + 3.0
+            else:
+                self.fr_send({"t": "fr_del", "u": f["u"]})
+        elif tab == 1 and 0 <= sel < len(self.fr["in"]):
+            self.fr_send({"t": "fr_acc" if primary else "fr_rej", "u": self.fr["in"][sel]})
+        elif tab == 2 and primary and self.fr_input.strip():
+            self.fr_send({"t": "fr_add", "u": self.fr_input.strip()})
+            self.fr_input = ""
+
+    def fr_join_selected(self):
+        if self.fr_tab == 0 and 0 <= self.fr_sel < len(self.fr["f"]):
+            f = self.fr["f"][self.fr_sel]
+            if f["on"]:
+                self.fr_join(f["p"], f["u"])
+
+    def fr_key(self, key, uni):
+        if key in (pygame.K_ESCAPE, pygame.K_TAB):
+            self.fr_toggle(False)
+        elif key == pygame.K_LEFT and not (self.fr_tab == 2 and self.fr_input):
+            self.fr_tab, self.fr_sel = (self.fr_tab - 1) % 3, 0
+        elif key == pygame.K_RIGHT and not (self.fr_tab == 2 and self.fr_input):
+            self.fr_tab, self.fr_sel = (self.fr_tab + 1) % 3, 0
+        elif key == pygame.K_UP:
+            self.fr_sel = max(0, self.fr_sel - 1)
+        elif key == pygame.K_DOWN:
+            self.fr_sel = min(max(0, self.fr_len() - 1), self.fr_sel + 1)
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.fr_action(True)
+        elif self.fr_tab == 2:
+            if key == pygame.K_BACKSPACE:
+                self.fr_input = self.fr_input[:-1]
+            elif uni and len(self.fr_input) < USER_MAX and (uni.isalnum() or uni == "_") and uni.isascii():
+                self.fr_input += uni
+        elif key == pygame.K_j:
+            self.fr_join_selected()
+        elif key in (pygame.K_DELETE, pygame.K_x):
+            self.fr_action(False)
+        elif key == pygame.K_a and self.fr_tab == 1:
+            self.fr_action(True)
+        elif key == pygame.K_r and self.fr_tab == 1:
+            self.fr_action(False)
+        elif key == pygame.K_i and self.fr_tab == 0:
+            self.fr_action(True)
+
+    def fr_click(self, pos):
+        R = self.fr_rects()
+        if not R["box"].collidepoint(pos):
+            self.fr_toggle(False)
+            return
+        for i, r in enumerate(R["tabs"]):
+            if r.collidepoint(pos):
+                self.fr_tab, self.fr_sel = i, 0
+                return
+        for i, r in enumerate(R["rows"]):
+            if r.collidepoint(pos) and i < self.fr_len():
+                self.fr_sel = i
+                return
+        if R["act"].collidepoint(pos):
+            self.fr_action(True)
+        elif R["alt"].collidepoint(pos):
+            if self.fr_tab == 0:
+                self.fr_join_selected()
+            else:
+                self.fr_action(False)
+
+    def fr_invite_answer(self, yes):
+        if not self.fr_inv:
+            return
+        inv = self.fr_inv.pop(0)
+        if yes:
+            self.fr_join(inv["p"], inv["from"])
+
+    def draw_friends_hud(self):
+        """Botão AMIGOS, aviso de convite recebido e painel de amigos."""
+        scr, R = self.screen, self.fr_rects()
+        self.fr_inv = [i for i in self.fr_inv if i["until"] > self.t]
+        pend = len(self.fr["in"])
+        r = R["hud"]
+        if self.mp_room == "lobby":
+            self.rrect(r, (10, 8, 14, 190), 10, 2, (110, 150, 110, 255))
+            self.text("AMIGOS (TAB)" + (f"  •  {pend} pedido(s)" if pend else ""), 16, (170, 235, 170), r.center, shadow=False)
+        if self.fr_inv:
+            inv = self.fr_inv[0]
+            bx = pygame.Rect(W // 2 - 220, 44, 440, 76)
+            self.rrect(bx, (14, 20, 14, 240), 12, 3, (120, 220, 130, 255))
+            self.text(f"{inv['from']} convidou você para jogar junto!", 20, (240, 255, 240), (bx.centerx, bx.y + 14), shadow=False)
+            for rr, lab, col in ((R["inv_yes"], "ACEITAR (Y)", (60, 150, 70)), (R["inv_no"], "RECUSAR (N)", (150, 60, 60))):
+                self.rrect(rr, col + (255,), 8, 2, (240, 240, 240, 255))
+                self.text(lab, 18, (255, 255, 255), rr.center, shadow=False)
+        if self.fr_note and self.t < self.fr_note_t and not self.fr_open:
+            self.otext(self.fr_note, 20, (200, 245, 200), (W // 2, 150 if self.fr_inv else 56), ow=2)
+        if not self.fr_open:
+            return
+        box = R["box"]
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 120))
+        scr.blit(dim, (0, 0))
+        self.rrect(box, (14, 12, 20, 245), 16, 3, (120, 150, 120, 255))
+        me = self.cfg.get("username") or "?"
+        self.text(f"AMIGOS  •  você é  {me}", 24, (255, 236, 170), (box.centerx, box.y + 22), shadow=False)
+        for i, tr in enumerate(R["tabs"]):
+            on = i == self.fr_tab
+            self.rrect(tr, (60, 90, 60, 255) if on else (28, 26, 34, 255), 8, 2, (150, 220, 150, 255) if on else (70, 66, 80, 255))
+            lab = self.FR_TABS[i] + (f" ({pend})" if i == 1 and pend else "")
+            self.text(lab, 18, (255, 255, 255) if on else (170, 166, 180), tr.center, shadow=False)
+        rows = R["rows"]
+        if self.fr_tab == 0:
+            lst = self.fr["f"]
+            if not lst:
+                self.text("Nenhum amigo ainda. Use a aba ADICIONAR.", 19, (190, 186, 200), (box.centerx, box.y + 180), shadow=False)
+            for i, f in enumerate(lst[:6]):
+                rr = rows[i]
+                self.rrect(rr, (40, 56, 40, 255) if i == self.fr_sel else (24, 22, 30, 255), 8, 2,
+                           (150, 220, 150, 255) if i == self.fr_sel else (60, 56, 70, 255))
+                pygame.draw.circle(scr, (90, 220, 110) if f["on"] else (100, 96, 104), (rr.x + 16, rr.centery), 6)
+                self.text(f["u"], 21, (255, 255, 255) if f["on"] else (150, 146, 156), (rr.x + 32, rr.centery), center=False, shadow=False)
+                self.text(f["s"] if f["on"] else "offline", 17, (170, 220, 170) if f["on"] else (120, 116, 126),
+                          (rr.right - 12 - self.font(17).size(f["s"] if f["on"] else "offline")[0], rr.centery), center=False, shadow=False)
+            a1, a2 = "CONVIDAR (ENTER)", "IR ATÉ ELE (J)"
+        elif self.fr_tab == 1:
+            lst = self.fr["in"]
+            if not lst:
+                self.text("Nenhum pedido de amizade.", 19, (190, 186, 200), (box.centerx, box.y + 180), shadow=False)
+            for i, nm in enumerate(lst[:6]):
+                rr = rows[i]
+                self.rrect(rr, (40, 56, 40, 255) if i == self.fr_sel else (24, 22, 30, 255), 8, 2,
+                           (150, 220, 150, 255) if i == self.fr_sel else (60, 56, 70, 255))
+                self.text(f"{nm} quer ser seu amigo", 20, (255, 255, 255), (rr.x + 14, rr.centery), center=False, shadow=False)
+            a1, a2 = "ACEITAR (ENTER)", "RECUSAR (R)"
+        else:
+            self.text("Digite o nome de usuário do seu amigo:", 19, (210, 206, 220), (box.centerx, box.y + 112), shadow=False)
+            fld = pygame.Rect(box.x + 90, box.y + 140, box.w - 180, 44)
+            self.rrect(fld, (8, 8, 14, 255), 8, 2, (150, 165, 230, 255))
+            self.text(self.fr_input + ("|" if int(self.t * 2) % 2 == 0 else " "), 26, (255, 255, 255), fld.center, shadow=False)
+            if self.fr["out"]:
+                self.text("Aguardando resposta: " + ", ".join(self.fr["out"][:4]), 17, (190, 186, 200), (box.centerx, box.y + 220), shadow=False)
+            a1, a2 = "ENVIAR PEDIDO (ENTER)", ""
+        for rr, lab, col in ((R["act"], a1, (50, 110, 60)), (R["alt"], a2, (90, 60, 110))):
+            if lab:
+                self.rrect(rr, col + (255,), 8, 2, (230, 230, 240, 255))
+                self.text(lab, 18, (255, 255, 255), rr.center, shadow=False)
+        if self.fr_note and self.t < self.fr_note_t:
+            self.text(self.fr_note, 19, (200, 245, 200), (box.centerx, box.bottom - 80), shadow=False)
+        self.text("← →  abas   ↑ ↓  escolher   X remover   TAB/ESC  fechar", 15, (150, 146, 160), (box.centerx, box.bottom - 12), shadow=False)
 
     def mp_send_state(self, dt=0.0, force=False):
         self.mp_ping_t = getattr(self, "mp_ping_t", 0.0) - dt
@@ -7207,6 +7722,15 @@ class MPMixin:
 
     # ------------------------------------------------------------------ teclado / mouse
     def mp_key(self, key, uni):
+        if self.fr_open:
+            self.fr_key(key, uni)
+            return True
+        if self.mp_typing is None and self.fr_inv and key in (pygame.K_y, pygame.K_n):
+            self.fr_invite_answer(key == pygame.K_y)
+            return True
+        if self.mp_typing is None and self.mp_room == "lobby" and key == pygame.K_TAB:
+            self.fr_toggle(True)
+            return True
         if self.mp_typing is not None:
             if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 txt, self.mp_typing = self.mp_typing.strip(), None
@@ -7254,6 +7778,19 @@ class MPMixin:
         return True
 
     def mp_game_click(self, pos):
+        R = self.fr_rects()
+        if self.fr_open:
+            self.fr_click(pos)
+            return
+        if self.fr_inv and R["inv_yes"].collidepoint(pos):
+            self.fr_invite_answer(True)
+            return
+        if self.fr_inv and R["inv_no"].collidepoint(pos):
+            self.fr_invite_answer(False)
+            return
+        if self.mp_room == "lobby" and R["hud"].collidepoint(pos):
+            self.fr_toggle(True)
+            return
         if self.menu_btn_rect().collidepoint(pos):
             self.back_to_menu()
         elif self.smith_hint is not None and self.smith_hint.collidepoint(pos) and self.smith_near():
@@ -7352,7 +7889,7 @@ class MPMixin:
         # sala
         self.ptext("ARENA" if arena else "LOBBY", 16, (255, 110, 100) if arena else (226, 192, 128), (W // 2 - 60, 22), 2)
         # placar
-        rows = [(self.saves[self.slot]["name"] if self.slot is not None and self.saves[self.slot] else "Você", self.mp_k, self.mp_d,
+        rows = [(self.cfg.get("username") or (self.saves[self.slot]["name"] if self.slot is not None and self.saves[self.slot] else "Você"), self.mp_k, self.mp_d,
                  self.hero["color"], True)]
         rows += [(q.get("n", "?"), q.get("k", 0), q.get("d", 0), self.mp_hero_color(q.get("h")), False) for q in self.mp_players.values()]
         rows.sort(key=lambda r: (-r[1], r[2]))
@@ -7377,10 +7914,11 @@ class MPMixin:
             self.rrect(r_, (8, 8, 14, 230), 8, 2, (150, 165, 230, 255))
             self.text("Chat: " + self.mp_typing + ("|" if int(self.t * 2) % 2 == 0 else ""), 22, (255, 255, 255), (r_.x + 8, r_.centery), center=False, shadow=False)
         hint = ("J leve  L forte  K/ESPAÇO rolar  Q/R habilidade  TAB mira  B lobby  ENTER chat" if arena
-                else "WASD andar  •  E loja (perto do ferreiro/mercador)  •  I inventário  •  ENTER chat  •  poço = ARENA")
+                else "WASD andar  •  E loja  •  I inventário  •  ENTER chat  •  TAB amigos  •  poço = ARENA")
         self.text(hint, 18, (200, 196, 210), (W // 2, H - 14), shadow=True)
         for f in self.floaters:
             self.text(f["s"], 40, f["c"], self.view_map(f["x"], f["y"]))
+        self.draw_friends_hud()
         if self.mp_dead:
             ov = pygame.Surface((W, H), pygame.SRCALPHA)
             ov.fill((120, 0, 0, 90))
@@ -7467,6 +8005,8 @@ class Game(MPMixin):
         self.mp_init()
         self.auto_host = AutoHost() if (self.cfg.get("auto_host") or "--abrir" in sys.argv) else None
         self.new_run(title=True)
+        if not self.cfg.get("username"):                     # primeira vez: escolhe o nome de usuário único
+            self.open_username("", "title")
 
     # ---------------------------------------------------------- utilidades
     def font(self, size):
@@ -10675,6 +11215,9 @@ class Game(MPMixin):
         if ph == "mp_menu":
             self.mp_menu_click(pos)
             return
+        if ph == "username":
+            self.username_click(pos)
+            return
         if ph == "title":
             for i, r in enumerate(self.title_btns()):
                 if r.collidepoint(pos):
@@ -11857,6 +12400,8 @@ class Game(MPMixin):
             self.draw_create()
         elif self.phase == "mp_menu":
             self.draw_mpmenu()
+        elif self.phase == "username":
+            self.draw_username()
         else:
             self.draw_title_menu()
 
@@ -11974,6 +12519,9 @@ class Game(MPMixin):
         ph = self.phase
         if ph == "mp_menu":
             self.mpmenu_key(key, uni)
+            return
+        if ph == "username":
+            self.username_key(key, uni)
             return
         if ph == "mp" and self.mp_key(key, uni):
             return
