@@ -1,0 +1,15 @@
+OBSCURITY - pacote completo
+
+JOGAR (Windows)
+  JOGAR.bat ............ abre o jogo (instala o pygame na primeira vez)
+  CRIAR_EXE.bat ........ gera o Obscurity.exe (veja LEIA-ME-EXE.md)
+
+MULTIPLAYER PUBLICO (3 servidores, 6 vagas cada)
+  pasta "servidor" ..... servidor_publico.py + Docker + servico Linux
+                         (passo a passo em servidor/LEIA-ME-SERVIDOR.md)
+  Depois de subir o servidor, troque PUBLIC_HOST no rpg.py pelo IP/dominio dele.
+
+BUILD NA NUVEM (sem Python no PC)
+  .github/workflows/build-exe.yml  (veja LEIA-ME-EXE.md)
+
+Requisitos: Python 3.12 (https://www.python.org/downloads/) com "Add python.exe to PATH".

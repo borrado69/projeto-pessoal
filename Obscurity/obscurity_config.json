@@ -1,0 +1,10 @@
+{
+  "mode": "manual",
+  "speed": 1.0,
+  "music": true,
+  "music_vol": 1.0,
+  "sfx": true,
+  "shake": true,
+  "mp_addr": "192.168.1.10.5555",
+  "public_host": ""
+}

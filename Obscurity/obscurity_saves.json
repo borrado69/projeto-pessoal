@@ -1,0 +1,25 @@
+[
+  {
+    "name": "jooji",
+    "hero": "rogue",
+    "best": 1,
+    "runs": 1,
+    "gold": 0,
+    "weapon": 0,
+    "armor": 0,
+    "attrs": {
+      "des": 17,
+      "for": 12,
+      "int": 10,
+      "con": 8,
+      "sab": 8,
+      "car": 11
+    },
+    "race": "tiefling",
+    "bag": []
+  },
+  null,
+  null,
+  null,
+  null
+]
