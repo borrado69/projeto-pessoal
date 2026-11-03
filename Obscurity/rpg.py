@@ -45,10 +45,17 @@ MAX_HEARTS = 6                # limite de vidas
 HERO_SCALE = 1.35             # escala com que o herói é desenhado (zumbi e esqueleto usam a mesma)
 
 # ------------------------------------------------------------- configurações
+_PERFIL = ""
+if "--perfil" in sys.argv:                  # python rpg.py --perfil ana   (config separada: outro nome de usuário)
+    try:
+        _PERFIL = "".join(ch for ch in sys.argv[sys.argv.index("--perfil") + 1] if ch.isalnum())[:12]
+    except IndexError:
+        _PERFIL = ""
+_CFG_NAME = f"obscurity_config_{_PERFIL}.json" if _PERFIL else "obscurity_config.json"
 try:
-    CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obscurity_config.json")
+    CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), _CFG_NAME)
 except NameError:
-    CONFIG_PATH = "obscurity_config.json"
+    CONFIG_PATH = _CFG_NAME
 DEFAULT_CFG = {
     "mode": "auto",        # "auto" = o herói anda sozinho | "manual" = você controla (WASD / setas)
     "speed": 1.0,          # velocidade do herói (0.6 .. 1.6)
@@ -5650,7 +5657,7 @@ PROTO = 2
 DEFAULT_PORT = 5555
 MAX_PLAYERS = 12
 # --- servidores PÚBLICOS (3 salas fixas, 6 vagas cada, entrada instantânea) ---
-PUBLIC_MAX = 6                                   # vagas de cada servidor público
+PUBLIC_MAX = 12                                  # vagas de cada servidor público
 PUBLIC_HOST = "127.0.0.1"                        # <<< TROQUE pelo DOMÍNIO/IP fixo da máquina que roda:  python rpg.py --public
 # (opcional) URL de um arquivo de TEXTO com o host atual (1 linha, ex.: raw do GitHub). Assim, se o IP do servidor
 # mudar, é só editar esse arquivo: quem já baixou o jogo continua entrando sem atualizar nada.
@@ -5671,6 +5678,108 @@ try:
     SOCIAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obscurity_users.json")
 except NameError:
     SOCIAL_PATH = "obscurity_users.json"
+
+
+LAN_PORT = 5554
+LAN_MAGIC = b"OBSCURITY?"
+
+
+class _LanResponder:
+    """Responde 'tem servidor aí?' na rede local. Um só por programa; compartilhado por todos os Server."""
+
+    def __init__(self):
+        self.servers, self.sock, self.lock = [], None, threading.Lock()
+
+    def add(self, srv):
+        with self.lock:
+            if srv not in self.servers:
+                self.servers.append(srv)
+            if self.sock is None:
+                try:
+                    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sk.bind(("", LAN_PORT))
+                except OSError:
+                    return                      # outro programa neste PC já responde
+                self.sock = sk
+                threading.Thread(target=self._loop, args=(sk,), daemon=True).start()
+
+    def remove(self, srv):
+        with self.lock:
+            if srv in self.servers:
+                self.servers.remove(srv)
+            if not self.servers and self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+
+    def _loop(self, sk):
+        while True:
+            try:
+                data, addr = sk.recvfrom(256)
+            except OSError:
+                return
+            if data.strip() != LAN_MAGIC:
+                continue
+            with self.lock:
+                info = [{"n": sv.name or f"Servidor {sv.port}", "port": sv.port, "p": sv.count(), "max": sv.max_players}
+                        for sv in self.servers if sv.running]
+            if info:
+                try:
+                    sk.sendto(json.dumps({"obscurity": PROTO, "s": info}).encode("utf-8"), addr)
+                except OSError:
+                    pass
+
+
+_LAN = _LanResponder()
+
+
+def lan_discover(timeout=1.3):
+    """Procura servidores na rede local (e neste PC). Retorna [{'host','port','n','p','max'}]."""
+    found = {}
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sk.settimeout(0.2)
+    except OSError:
+        return []
+    targets = [("127.0.0.1", LAN_PORT), ("255.255.255.255", LAN_PORT)]
+    ip = lan_ip()
+    if not ip.startswith("127."):
+        targets.append((ip.rsplit(".", 1)[0] + ".255", LAN_PORT))
+    t0, last = time.time(), 0.0
+    while time.time() - t0 < timeout:
+        if time.time() - last > 0.45:
+            last = time.time()
+            for tg in targets:
+                try:
+                    sk.sendto(LAN_MAGIC, tg)
+                except OSError:
+                    pass
+        try:
+            data, addr = sk.recvfrom(2048)
+            m = json.loads(data.decode("utf-8"))
+        except (socket.timeout, OSError, ValueError):
+            continue
+        if not isinstance(m, dict) or m.get("obscurity") != PROTO:
+            continue
+        for sv in m.get("s", [])[:8]:
+            try:
+                port = int(sv["port"])
+                found[(addr[0], port)] = dict(host=addr[0], port=port, n=_clean_text(sv.get("n"), 16),
+                                              p=int(_num(sv.get("p"), 0, 999)), max=int(_num(sv.get("max"), 1, 999, 12)))
+            except (KeyError, TypeError, ValueError):
+                continue
+    sk.close()
+    # o mesmo servidor aparece pelo 127.0.0.1 e pelo IP da rede: fica só um por porta
+    best = {}
+    for v in found.values():
+        k = (v["port"], v["n"])
+        if k not in best or best[k]["host"].startswith("127."):
+            best[k] = v
+    return list(best.values())
 
 
 def valid_user(u):
@@ -6140,7 +6249,7 @@ class _Conn:
 
 class Server:
     def __init__(self, port=DEFAULT_PORT, host="0.0.0.0", log=print, max_players=MAX_PLAYERS, name="", social=None):
-        self.social = social              # com contas/amigos (servidores públicos); None = servidor privado simples
+        self.social = social if social is not None else get_social()   # contas/amigos em qualquer servidor
         self.port, self.host, self.log = port, host, log
         self.max_players, self.name = max_players, name
         self.lock = threading.RLock()
@@ -6158,11 +6267,13 @@ class Server:
         self.lsock, self.running = s, True
         threading.Thread(target=self._accept_loop, daemon=True).start()
         threading.Thread(target=self._snap_loop, daemon=True).start()
+        _LAN.add(self)
         self.log(f"[obscurity] servidor ouvindo em {self.host}:{self.port}")
         return self
 
     def stop(self):
         self.running = False
+        _LAN.remove(self)
         try:
             self.lsock.shutdown(socket.SHUT_RDWR)        # acorda o accept() para a porta fechar de verdade
         except Exception:
@@ -6325,11 +6436,16 @@ class Server:
             return
 
         if t in ("fr_add", "fr_acc", "fr_rej", "fr_del", "inv"):
-            if self.social is not None and c.ukey:
-                now = time.time()
-                if now - getattr(c, "t_soc", 0.0) >= 0.3:       # anti-spam
-                    c.t_soc = now
-                    self.social.handle(c.ukey, m)
+            if self.social is None or not c.ukey:
+                c.send({"t": "note", "msg": "Amigos não estão disponíveis neste servidor."})
+                return
+            now = time.time()
+            if now - getattr(c, "t_soc", 0.0) < 0.3:            # anti-spam
+                c.send({"t": "note", "msg": "Calma! Tente de novo em um instante."})
+                return
+            c.t_soc = now
+            self.log(f"[obscurity] amigos: {c.name} -> {t} {str(m.get('u', ''))[:12]}")
+            self.social.handle(c.ukey, m)
             return
         if t == "state":
             st = c.st
@@ -6594,6 +6710,7 @@ class MPMixin:
         self.fr = {"f": [], "in": [], "out": []}
         self.fr_open, self.fr_tab, self.fr_sel, self.fr_input = False, 0, 0, ""
         self.fr_inv, self.fr_note, self.fr_note_t = [], "", 0.0
+        self._lan_res = None
         self.mp_cur = None
         self.us_text, self.us_msg = "", ""
         self.mp_pub = [dict(name=n, host=self.mp_pub_host(), port=pt, ok=None, p=0, max=PUBLIC_MAX) for n, pt in PUBLIC_SERVERS]
@@ -6779,7 +6896,48 @@ class MPMixin:
         if R["char"].collidepoint(pos):
             self.mp_cycle_slot(-1 if pos[0] < R["char"].centerx else +1)
 
+    def mp_lan_start(self):
+        m = self.mp_m
+        m["lan_busy"], m["msg"] = True, "Procurando servidor na rede..."
+        self._lan_res = None
+
+        def work():
+            self._lan_res = lan_discover()
+        threading.Thread(target=work, daemon=True).start()
+
+    def mp_lan_done(self):
+        """Achou servidor na rede -> entra. Não achou -> este jogo abre um (os próximos jogadores acham sozinhos)."""
+        m, res = self.mp_m, self._lan_res
+        m["lan_busy"], self._lan_res = False, None
+        if self.phase != "mp_menu" or m["busy"] or self.mp_net is not None or m["slot"] is None:
+            return
+        cand = sorted([x for x in res if x["p"] < x["max"]], key=lambda x: -x["p"])
+        if cand:
+            m["queue"] = [dict(name=x["n"], host=x["host"], port=x["port"]) for x in cand[1:]]
+            self.mp_cancel()
+            self.mp_connect(cand[0]["host"], cand[0]["port"], f"Entrando em {cand[0]['n']} ...")
+            return
+        if res:
+            m["msg"] = "Os servidores da rede estão cheios. Tente de novo em instantes."
+            self.play("bad")
+            return
+        for port in range(DEFAULT_PORT, DEFAULT_PORT + 6):           # ninguém tem servidor: abre um aqui
+            try:
+                self.mp_server = Server(port, log=lambda *a: None, name="Servidor de " + (self.cfg.get("username") or "casa")[:8]).start()
+                break
+            except OSError:
+                continue
+        else:
+            m["msg"] = "Não foi possível abrir um servidor neste PC (portas ocupadas)."
+            self.play("bad")
+            return
+        m["queue"] = []
+        if self.cfg.get("auto_host"):
+            threading.Thread(target=upnp_open, args=([port],), daemon=True).start()
+        self.mp_connect("127.0.0.1", port, "Nenhum servidor encontrado: abrindo um aqui. Quem estiver na sua rede entra sozinho!")
+
     def mp_cancel(self):
+        self.mp_m["lan_busy"] = False
         if self.mp_net is not None:
             self.mp_net.close()
             self.mp_net = None
@@ -6887,14 +7045,13 @@ class MPMixin:
                 m["auto"] = False
                 if any(x["ok"] and x["p"] < x["max"] for x in self.mp_pub):
                     self.mp_quick_join()
+                elif all(x["ok"] is False for x in self.mp_pub):
+                    self.mp_lan_start()                    # sem público: procura na rede; se ninguém tiver, abre um
                 else:
-                    host = self.mp_pub_host()
-                    if all(x["ok"] is False for x in self.mp_pub):
-                        m["msg"] = ("Servidor público não configurado (PUBLIC_HOST no código)." if host in PUBLIC_LOCAL
-                                    else "Servidores públicos offline agora. Tente de novo ou use HOSPEDAR AQUI.")
-                    else:
-                        m["msg"] = "Todos os servidores públicos estão cheios. Tente de novo em instantes."
+                    m["msg"] = "Todos os servidores públicos estão cheios. Tente de novo em instantes."
                     self.play("bad")
+            if m.get("lan_busy") and self._lan_res is not None:
+                self.mp_lan_done()
         if self.mp_net is None:
             return
         for msg in self.mp_net.poll():
@@ -7213,7 +7370,11 @@ class MPMixin:
         elif tab == 1 and 0 <= sel < len(self.fr["in"]):
             self.fr_send({"t": "fr_acc" if primary else "fr_rej", "u": self.fr["in"][sel]})
         elif tab == 2 and primary and self.fr_input.strip():
+            if self.mp_net is None or self.mp_net.status != "connected":
+                self.fr_note, self.fr_note_t = "Sem conexão com o servidor.", self.t + 4.0
+                return
             self.fr_send({"t": "fr_add", "u": self.fr_input.strip()})
+            self.fr_note, self.fr_note_t = f"Enviando pedido para {self.fr_input.strip()}...", self.t + 4.0
             self.fr_input = ""
 
     def fr_join_selected(self):
